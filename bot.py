@@ -138,7 +138,19 @@ def extract_page_title(html: str) -> str | None:
 
 
 def extract_price_from_html(html: str) -> str | None:
-    for pattern in PRICE_PATTERNS:
+    patterns = [
+        r'id="corePrice_feature_div".*?a-offscreen">([^<]+)<',
+        r'id="price_inside_buybox"[^>]*>([^<]+)<',
+        r'id="newBuyBoxPrice"[^>]*>([^<]+)<',
+        r'id="priceblock_ourprice"[^>]*>([^<]+)<',
+        r'id="priceblock_dealprice"[^>]*>([^<]+)<',
+        r'"displayPrice":"([^"]+)"',
+        r'"priceToPay":"([^"]+)"',
+        r'"price":"([^"]+)"',
+        r'<span[^>]*class="[^"]*a-price-whole[^"]*"[^>]*>([^<]+)<',
+        r'<span[^>]*class="[^"]*a-price-fraction[^"]*"[^>]*>([^<]+)<',
+    ]
+    for pattern in patterns:
         match = re.search(pattern, html, re.DOTALL)
         if match:
             price = re.sub(r"\s+", " ", match.group(1)).strip()
