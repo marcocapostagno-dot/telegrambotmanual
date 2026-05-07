@@ -36,6 +36,8 @@ DISCLOSURE = os.getenv(
     "POST_DISCLOSURE",
     "Questo post contiene link affiliati Amazon.",
 ).strip()
+BRAND_TAG = os.getenv("BRAND_TAG", "@capofferte").strip()
+DEFAULT_BADGE = os.getenv("DEFAULT_BADGE", "TOP DEAL").strip()
 STORE_FILE = Path(os.getenv("BOT_STORE_FILE", "bot_store.json")).expanduser()
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 AMAZON_HOSTS = {"amazon.it", "www.amazon.it", "amzn.to", "www.amzn.to"}
@@ -44,6 +46,8 @@ SHORT_TEXT_RE = re.compile(r"^/post(?:@\w+)?\s+(.+)$", re.DOTALL)
 URL_RE = re.compile(r"https?://\S+")
 OG_IMAGE_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE)
 TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+FIELD_RE = re.compile(r"^(titolo|prezzo|prima|originale|sconto|badge|categoria)\s*:\s*(.+)$", re.IGNORECASE)
+NUMBER_RE = re.compile(r"(\d+(?:[\.,]\d+)?)")
 
 
 def load_store() -> dict:
@@ -152,6 +156,132 @@ def extract_page_title(html: str) -> str | None:
     return title[:220] if title else None
 
 
+def parse_structured_fields(text: str) -> dict:
+    fields = {}
+    extra_lines = []
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = FIELD_RE.match(line)
+        if match:
+            key = match.group(1).lower()
+            value = match.group(2).strip()
+            fields[key] = value
+        else:
+            extra_lines.append(line)
+
+    if extra_lines and "titolo" not in fields:
+        fields["titolo"] = " ".join(extra_lines).strip()
+
+    return fields
+
+
+def parse_price_value(value: str | None) -> float | None:
+    if not value:
+        return None
+    match = NUMBER_RE.search(value.replace("€", "").replace(" ", ""))
+    if not match:
+        return None
+    raw = match.group(1).replace(".", "").replace(",", ".")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def parse_discount_percent(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = NUMBER_RE.search(value)
+    if not match:
+        return None
+    try:
+        return int(float(match.group(1).replace(",", ".")))
+    except ValueError:
+        return None
+
+
+def compute_discount_percent(discounted_price: str | None, original_price: str | None) -> int | None:
+    discounted = parse_price_value(discounted_price)
+    original = parse_price_value(original_price)
+    if discounted is None or original is None or original <= 0 or discounted >= original:
+        return None
+    return round((1 - (discounted / original)) * 100)
+
+
+def choose_badge_and_intro(
+    explicit_badge: str | None,
+    discounted_price: str | None,
+    original_price: str | None,
+    discount_label: str | None,
+) -> tuple[str, str, str]:
+    if explicit_badge:
+        badge = explicit_badge.strip()
+    else:
+        percent = parse_discount_percent(discount_label)
+        if percent is None:
+            percent = compute_discount_percent(discounted_price, original_price)
+
+        price_value = parse_price_value(discounted_price)
+
+        if percent is not None and percent >= 70:
+            badge = "ERRORE PREZZO"
+        elif price_value is not None and price_value <= 10:
+            badge = "SOTTOCOSTO"
+        elif percent is not None and percent >= 45:
+            badge = "TOP DEAL"
+        else:
+            badge = DEFAULT_BADGE
+
+    badge_upper = badge.upper()
+
+    if badge_upper == "ERRORE PREZZO":
+        return badge_upper, "🚨", "PREZZO ASSURDO"
+    if badge_upper == "SOTTOCOSTO":
+        return badge_upper, "💥", "SOTTOCOSTO VERO"
+    if badge_upper == "TOP DEAL":
+        return badge_upper, "🔥", "OFFERTA TOP"
+    return badge_upper, "⚡", badge_upper
+
+
+def choose_category_emoji(category: str | None, title: str | None) -> str:
+    haystack = f"{category or ''} {title or ''}".lower()
+    mapping = [
+        ("smart home", "🏠"),
+        ("casa", "🏠"),
+        ("tv", "📺"),
+        ("monitor", "🖥"),
+        ("pc", "💻"),
+        ("notebook", "💻"),
+        ("laptop", "💻"),
+        ("tablet", "📱"),
+        ("iphone", "📱"),
+        ("smartphone", "📱"),
+        ("telefono", "📱"),
+        ("apple", "🍎"),
+        ("cuffie", "🎧"),
+        ("audio", "🎧"),
+        ("gaming", "🎮"),
+        ("console", "🎮"),
+        ("videogioco", "🎮"),
+        ("cucina", "🍳"),
+        ("elettrodomestici", "🔌"),
+        ("elettronica", "🔌"),
+        ("bambini", "🧸"),
+        ("giocattoli", "🧸"),
+        ("sport", "🏃"),
+        ("fitness", "🏃"),
+        ("libri", "📚"),
+        ("beauty", "💄"),
+    ]
+    for keyword, emoji in mapping:
+        if keyword in haystack:
+            return emoji
+    return "📦"
+
+
 def draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[
@@ -166,23 +296,65 @@ def published_key(url: str) -> str:
     return f"asin:{asin}" if asin else f"url:{url}"
 
 
-def build_caption(url: str, original_text: str, scraped_title: str | None = None) -> str:
-    asin = extract_asin(url)
-    lines = []
-    cleaned_text = (original_text or "").strip()
+def format_deal_message(
+    title: str,
+    discounted_price: str | None,
+    original_price: str | None,
+    link: str,
+    badge: str | None = None,
+    discount_label: str | None = None,
+    category: str | None = None,
+) -> str:
+    final_badge, intro_emoji, intro_text = choose_badge_and_intro(
+        badge,
+        discounted_price,
+        original_price,
+        discount_label,
+    )
+    category_emoji = choose_category_emoji(category, title)
 
-    if cleaned_text:
-        lines.append(escape(cleaned_text))
-    elif scraped_title:
-        lines.append(escape(scraped_title))
-    else:
-        lines.append("Nuova offerta Amazon")
+    safe_title = escape((title or "Nuova offerta Amazon").strip())
+    safe_link = escape(link.strip())
+    safe_discounted = escape((discounted_price or "Prezzo non specificato").strip())
+    safe_original = escape(original_price.strip()) if original_price else None
+    computed_discount = discount_label or (
+        f"-{compute_discount_percent(discounted_price, original_price)}%"
+        if compute_discount_percent(discounted_price, original_price) is not None
+        else None
+    )
+    safe_discount_label = escape(computed_discount.strip()) if computed_discount else None
+    safe_category = escape(category.strip()) if category else "Amazon"
+    safe_brand = escape(BRAND_TAG)
+    safe_disclosure = escape(DISCLOSURE)
+    safe_badge = escape(final_badge)
+    safe_intro_text = escape(intro_text)
 
-    if asin:
-        lines.append(f"ASIN: <code>{escape(asin)}</code>")
+    lines = [
+        f"{intro_emoji} <b>{safe_intro_text}</b>",
+        f"{category_emoji} <b>{safe_badge}</b>",
+        "",
+        f"<b>{safe_title}</b>",
+        "",
+        f"💸 <b>Prezzo:</b> {safe_discounted}",
+    ]
 
-    lines.append(f"<a href=\"{escape(url)}\">Apri offerta</a>")
-    lines.append(escape(DISCLOSURE))
+    if safe_original:
+        lines.append(f"🕵️ <b>Prima stava a:</b> <tg-spoiler>{safe_original}</tg-spoiler>")
+
+    if safe_discount_label:
+        lines.append(f"🏷 <b>Sconto:</b> {safe_discount_label}")
+
+    lines.extend(
+        [
+            f"📦 <b>Categoria:</b> {safe_category}",
+            "",
+            f"👉 <a href=\"{safe_link}\">VAI ALL'OFFERTA</a>",
+            "",
+            f"{safe_brand} | #offerte #amazon #capofferte",
+            safe_disclosure,
+        ]
+    )
+
     return "\n".join(lines)
 
 
@@ -193,7 +365,9 @@ def parse_submission_from_message(message: Message) -> dict:
         raise ValueError("Mandami un link Amazon valido nel testo o nella caption.")
 
     affiliate_url = normalize_amazon_url(url)
-    custom_text = text.replace(url, "", 1).strip(" -\n")
+    text_without_url = text.replace(url, "", 1).strip(" -\n")
+    fields = parse_structured_fields(text_without_url)
+
     photo_file_id = None
     image_url = None
     scraped_title = None
@@ -208,16 +382,37 @@ def parse_submission_from_message(message: Message) -> dict:
         except Exception as exc:
             logger.warning("Immagine automatica non trovata per %s: %s", affiliate_url, exc)
 
-    caption = build_caption(affiliate_url, custom_text, scraped_title)
+    title = fields.get("titolo") or scraped_title or "Nuova offerta Amazon"
+    discounted_price = fields.get("prezzo")
+    original_price = fields.get("prima") or fields.get("originale")
+    discount_label = fields.get("sconto")
+    badge = fields.get("badge")
+    category = fields.get("categoria")
+
+    caption = format_deal_message(
+        title=title,
+        discounted_price=discounted_price,
+        original_price=original_price,
+        link=affiliate_url,
+        badge=badge,
+        discount_label=discount_label,
+        category=category,
+    )
 
     return {
         "url": affiliate_url,
-        "text": custom_text,
+        "text": text_without_url,
         "caption": caption,
         "asin": extract_asin(affiliate_url),
         "photo_file_id": photo_file_id,
         "image_url": image_url,
         "scraped_title": scraped_title,
+        "title": title,
+        "discounted_price": discounted_price,
+        "original_price": original_price,
+        "discount_label": discount_label,
+        "category": category,
+        "badge": badge,
     }
 
 
@@ -260,7 +455,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_allowed(update):
         return
     await update.message.reply_text(
-        "Mandami un link Amazon, oppure foto + caption con link Amazon. Ti preparo una preview privata con immagine quando disponibile."
+        "Mandami un link Amazon, oppure foto + caption con campi tipo:\n"
+        "titolo: Echo Dot 5\n"
+        "prezzo: 24,99€\n"
+        "prima: 59,99€\n"
+        "sconto: -58%\n"
+        "categoria: Smart Home\n"
+        "https://www.amazon.it/dp/ASIN\n\n"
+        "Il badge e l'intro vengono scelti automaticamente se non li scrivi tu."
     )
 
 
@@ -268,13 +470,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_allowed(update):
         return
     await update.message.reply_text(
-        "Uso rapido:\n"
-        "1) Invia un link Amazon in privato\n"
-        "2) Oppure invia foto + caption con link Amazon\n"
-        "3) Ricevi anteprima privata con immagine\n"
-        "4) Premi Pubblica o Annulla\n\n"
-        "Comando supportato:\n"
-        "/post https://www.amazon.it/dp/ASIN Testo opzionale"
+        "Formato supportato:\n\n"
+        "titolo: Nome prodotto\n"
+        "prezzo: 24,99€\n"
+        "prima: 59,99€\n"
+        "sconto: -58%\n"
+        "badge: ERRORE PREZZO\n"
+        "categoria: Elettronica\n"
+        "https://www.amazon.it/dp/ASIN\n\n"
+        "Badge automatici:\n"
+        "- ERRORE PREZZO se sconto molto alto\n"
+        "- SOTTOCOSTO se prezzo bassissimo\n"
+        "- TOP DEAL negli altri casi forti"
     )
 
 
@@ -285,7 +492,7 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = update.message.text or ""
     match = SHORT_TEXT_RE.match(text)
     if not match:
-        await update.message.reply_text("Formato: /post LINK testo opzionale")
+        await update.message.reply_text("Formato: /post LINK oppure /post testo strutturato con link")
         return
 
     payload = match.group(1).strip()
@@ -461,5 +668,5 @@ def run() -> None:
             private_message_handler,
         )
     )
-    logger.info("Bot Amazon con immagini automatiche avviato")
+    logger.info("Bot Amazon con template aggressivo dinamico avviato")
     application.run_polling(drop_pending_updates=True)
