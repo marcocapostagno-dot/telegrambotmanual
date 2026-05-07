@@ -14,6 +14,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    CommandHandler,
     MessageHandler,
     filters,
 )
@@ -46,7 +47,6 @@ SHORT_TEXT_RE = re.compile(r"^/post(?:@\w+)?\s+(.+)$", re.DOTALL)
 URL_RE = re.compile(r"https?://\S+")
 OG_IMAGE_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE)
 TITLE_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-FIELD_RE = re.compile(r"^(titolo|prezzo|prima|originale|sconto|badge|categoria)\s*:\s*(.+)$", re.IGNORECASE)
 NUMBER_RE = re.compile(r"(\d+(?:[\.,]\d+)?)")
 
 
@@ -164,13 +164,30 @@ def parse_structured_fields(text: str) -> dict:
         line = raw_line.strip()
         if not line:
             continue
-        match = FIELD_RE.match(line)
-        if match:
-            key = match.group(1).lower()
-            value = match.group(2).strip()
-            fields[key] = value
-        else:
-            extra_lines.append(line)
+
+        if ":" in line:
+            key, value = line.split(":", 1)
+            normalized_key = key.strip().lower()
+            normalized_value = value.strip()
+            if normalized_key in {"titolo", "prezzo", "prima", "originale", "sconto", "badge", "categoria"}:
+                fields[normalized_key] = normalized_value
+                continue
+
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+            parsed_any = False
+            for part in parts:
+                if ":" in part:
+                    key, value = part.split(":", 1)
+                    normalized_key = key.strip().lower()
+                    normalized_value = value.strip()
+                    if normalized_key in {"titolo", "prezzo", "prima", "originale", "sconto", "badge", "categoria"}:
+                        fields[normalized_key] = normalized_value
+                        parsed_any = True
+            if parsed_any:
+                continue
+
+        extra_lines.append(line)
 
     if extra_lines and "titolo" not in fields:
         fields["titolo"] = " ".join(extra_lines).strip()
@@ -211,19 +228,13 @@ def compute_discount_percent(discounted_price: str | None, original_price: str |
     return round((1 - (discounted / original)) * 100)
 
 
-def choose_badge_and_intro(
-    explicit_badge: str | None,
-    discounted_price: str | None,
-    original_price: str | None,
-    discount_label: str | None,
-) -> tuple[str, str, str]:
+def choose_badge_and_intro(explicit_badge: str | None, discounted_price: str | None, original_price: str | None, discount_label: str | None) -> tuple[str, str, str]:
     if explicit_badge:
         badge = explicit_badge.strip()
     else:
         percent = parse_discount_percent(discount_label)
         if percent is None:
             percent = compute_discount_percent(discounted_price, original_price)
-
         price_value = parse_price_value(discounted_price)
 
         if percent is not None and percent >= 70:
@@ -236,7 +247,6 @@ def choose_badge_and_intro(
             badge = DEFAULT_BADGE
 
     badge_upper = badge.upper()
-
     if badge_upper == "ERRORE PREZZO":
         return badge_upper, "🚨", "PREZZO ASSURDO"
     if badge_upper == "SOTTOCOSTO":
@@ -282,46 +292,16 @@ def choose_category_emoji(category: str | None, title: str | None) -> str:
     return "📦"
 
 
-def draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✅ Pubblica", callback_data=f"publish:{draft_id}"),
-            InlineKeyboardButton("❌ Annulla", callback_data=f"cancel:{draft_id}"),
-        ]]
-    )
-
-
-def published_key(url: str) -> str:
-    asin = extract_asin(url)
-    return f"asin:{asin}" if asin else f"url:{url}"
-
-
-def format_deal_message(
-    title: str,
-    discounted_price: str | None,
-    original_price: str | None,
-    link: str,
-    badge: str | None = None,
-    discount_label: str | None = None,
-    category: str | None = None,
-) -> str:
-    final_badge, intro_emoji, intro_text = choose_badge_and_intro(
-        badge,
-        discounted_price,
-        original_price,
-        discount_label,
-    )
+def format_deal_message(title: str, discounted_price: str | None, original_price: str | None, link: str, badge: str | None = None, discount_label: str | None = None, category: str | None = None) -> str:
+    final_badge, intro_emoji, intro_text = choose_badge_and_intro(badge, discounted_price, original_price, discount_label)
     category_emoji = choose_category_emoji(category, title)
 
     safe_title = escape((title or "Nuova offerta Amazon").strip())
     safe_link = escape(link.strip())
     safe_discounted = escape((discounted_price or "Prezzo non specificato").strip())
     safe_original = escape(original_price.strip()) if original_price else None
-    computed_discount = discount_label or (
-        f"-{compute_discount_percent(discounted_price, original_price)}%"
-        if compute_discount_percent(discounted_price, original_price) is not None
-        else None
-    )
+    computed_discount_value = compute_discount_percent(discounted_price, original_price)
+    computed_discount = discount_label or (f"-{computed_discount_value}%" if computed_discount_value is not None else None)
     safe_discount_label = escape(computed_discount.strip()) if computed_discount else None
     safe_category = escape(category.strip()) if category else "Amazon"
     safe_brand = escape(BRAND_TAG)
@@ -340,21 +320,17 @@ def format_deal_message(
 
     if safe_original:
         lines.append(f"🕵️ <b>Prima stava a:</b> <tg-spoiler>{safe_original}</tg-spoiler>")
-
     if safe_discount_label:
         lines.append(f"🏷 <b>Sconto:</b> {safe_discount_label}")
 
-    lines.extend(
-        [
-            f"📦 <b>Categoria:</b> {safe_category}",
-            "",
-            f"👉 <a href=\"{safe_link}\">VAI ALL'OFFERTA</a>",
-            "",
-            f"{safe_brand} | #offerte #amazon #capofferte",
-            safe_disclosure,
-        ]
-    )
-
+    lines.extend([
+        f"📦 <b>Categoria:</b> {safe_category}",
+        "",
+        f"👉 <a href=\"{safe_link}\">VAI ALL'OFFERTA</a>",
+        "",
+        f"{safe_brand} | #offerte #amazon #capofferte",
+        safe_disclosure,
+    ])
     return "\n".join(lines)
 
 
@@ -367,6 +343,7 @@ def parse_submission_from_message(message: Message) -> dict:
     affiliate_url = normalize_amazon_url(url)
     text_without_url = text.replace(url, "", 1).strip(" -\n")
     fields = parse_structured_fields(text_without_url)
+    logger.info("Campi estratti: %s", fields)
 
     photo_file_id = None
     image_url = None
@@ -416,6 +393,10 @@ def parse_submission_from_message(message: Message) -> dict:
     }
 
 
+def draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Pubblica", callback_data=f"publish:{draft_id}"), InlineKeyboardButton("❌ Annulla", callback_data=f"cancel:{draft_id}")]])
+
+
 def save_draft(user_id: int, draft: dict) -> str:
     store = load_store()
     draft_id = f"{user_id}_{len(store['drafts']) + 1}"
@@ -436,13 +417,13 @@ def delete_draft(draft_id: str) -> None:
 
 
 def is_duplicate(url: str) -> bool:
-    key = published_key(url)
+    key = f"asin:{extract_asin(url)}" if extract_asin(url) else f"url:{url}"
     store = load_store()
     return key in store.get("published", [])
 
 
 def mark_published(url: str) -> None:
-    key = published_key(url)
+    key = f"asin:{extract_asin(url)}" if extract_asin(url) else f"url:{url}"
     store = load_store()
     published = store.get("published", [])
     if key not in published:
@@ -462,7 +443,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "sconto: -58%\n"
         "categoria: Smart Home\n"
         "https://www.amazon.it/dp/ASIN\n\n"
-        "Il badge e l'intro vengono scelti automaticamente se non li scrivi tu."
+        "Puoi anche scrivere tutto su una riga con | tra i campi."
     )
 
 
@@ -470,18 +451,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_allowed(update):
         return
     await update.message.reply_text(
-        "Formato supportato:\n\n"
+        "Formati supportati:\n\n"
+        "Multiriga:\n"
         "titolo: Nome prodotto\n"
         "prezzo: 24,99€\n"
         "prima: 59,99€\n"
         "sconto: -58%\n"
-        "badge: ERRORE PREZZO\n"
         "categoria: Elettronica\n"
         "https://www.amazon.it/dp/ASIN\n\n"
-        "Badge automatici:\n"
-        "- ERRORE PREZZO se sconto molto alto\n"
-        "- SOTTOCOSTO se prezzo bassissimo\n"
-        "- TOP DEAL negli altri casi forti"
+        "Oppure singola riga:\n"
+        "titolo: Nome prodotto | prezzo: 24,99€ | prima: 59,99€ | sconto: -58% | categoria: Elettronica | https://www.amazon.it/dp/ASIN"
     )
 
 
@@ -507,47 +486,24 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def send_preview(message: Message, draft_id: str, draft: dict) -> None:
     preview_header = "📝 Anteprima privata\n\n"
     if draft.get("photo_file_id"):
-        await message.reply_photo(
-            photo=draft["photo_file_id"],
-            caption=preview_header + draft["caption"],
-            parse_mode=ParseMode.HTML,
-            reply_markup=draft_keyboard(draft_id),
-        )
+        await message.reply_photo(photo=draft["photo_file_id"], caption=preview_header + draft["caption"], parse_mode=ParseMode.HTML, reply_markup=draft_keyboard(draft_id))
         return
-
     if draft.get("image_url"):
         try:
-            await message.reply_photo(
-                photo=draft["image_url"],
-                caption=preview_header + draft["caption"],
-                parse_mode=ParseMode.HTML,
-                reply_markup=draft_keyboard(draft_id),
-            )
+            await message.reply_photo(photo=draft["image_url"], caption=preview_header + draft["caption"], parse_mode=ParseMode.HTML, reply_markup=draft_keyboard(draft_id))
             return
         except Exception as exc:
             logger.warning("Preview foto da URL fallita, fallback testo: %s", exc)
-
-    await message.reply_text(
-        preview_header + draft["caption"],
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=False,
-        reply_markup=draft_keyboard(draft_id),
-    )
+    await message.reply_text(preview_header + draft["caption"], parse_mode=ParseMode.HTML, disable_web_page_preview=False, reply_markup=draft_keyboard(draft_id))
 
 
-async def create_preview_from_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    source_message: Message | None = None,
-) -> None:
+async def create_preview_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE, source_message: Message | None = None) -> None:
     message = source_message or update.message
-
     try:
         draft = parse_submission_from_message(message)
         if is_duplicate(draft["url"]):
             await message.reply_text("Questo prodotto sembra già pubblicato sul canale.")
             return
-
         draft_id = save_draft(update.effective_user.id, draft)
         await send_preview(message, draft_id, draft)
     except Exception as exc:
@@ -565,16 +521,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     if query is None:
         return
-
     await query.answer()
-
     if not is_allowed(update):
         return
 
     data = query.data or ""
     if ":" not in data:
         return
-
     action, draft_id = data.split(":", 1)
     draft = get_draft(draft_id)
 
@@ -599,32 +552,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             sent = False
             if draft.get("photo_file_id"):
-                await context.bot.send_photo(
-                    chat_id=TARGET_CHANNEL,
-                    photo=draft["photo_file_id"],
-                    caption=draft["caption"],
-                    parse_mode=ParseMode.HTML,
-                )
+                await context.bot.send_photo(chat_id=TARGET_CHANNEL, photo=draft["photo_file_id"], caption=draft["caption"], parse_mode=ParseMode.HTML)
                 sent = True
             elif draft.get("image_url"):
                 try:
-                    await context.bot.send_photo(
-                        chat_id=TARGET_CHANNEL,
-                        photo=draft["image_url"],
-                        caption=draft["caption"],
-                        parse_mode=ParseMode.HTML,
-                    )
+                    await context.bot.send_photo(chat_id=TARGET_CHANNEL, photo=draft["image_url"], caption=draft["caption"], parse_mode=ParseMode.HTML)
                     sent = True
                 except Exception as exc:
                     logger.warning("Invio foto da URL fallito, fallback testo: %s", exc)
 
             if not sent:
-                await context.bot.send_message(
-                    chat_id=TARGET_CHANNEL,
-                    text=draft["caption"],
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False,
-                )
+                await context.bot.send_message(chat_id=TARGET_CHANNEL, text=draft["caption"], parse_mode=ParseMode.HTML, disable_web_page_preview=False)
 
             mark_published(draft["url"])
             delete_draft(draft_id)
@@ -662,11 +600,6 @@ def run() -> None:
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("resetpublished", reset_published_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
-    application.add_handler(
-        MessageHandler(
-            (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
-            private_message_handler,
-        )
-    )
-    logger.info("Bot Amazon con template aggressivo dinamico avviato")
+    application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, private_message_handler))
+    logger.info("Bot Amazon parsing prezzi corretto avviato")
     application.run_polling(drop_pending_updates=True)
