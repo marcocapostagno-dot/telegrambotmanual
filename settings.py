@@ -1,0 +1,10 @@
+import os
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_TARGET_CHANNEL = os.getenv("TELEGRAM_TARGET_CHANNEL", "@capofferte").strip()
+TELEGRAM_ADMIN_IDS = os.getenv("TELEGRAM_ADMIN_IDS", "").strip()
+AMAZON_PARTNER_TAG = os.getenv("AMAZON_PARTNER_TAG", "").strip()
+POST_DISCLOSURE = os.getenv(
+    "POST_DISCLOSURE",
+    "Questo post contiene link affiliati Amazon.",
+).strip()
