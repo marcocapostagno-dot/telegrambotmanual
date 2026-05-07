@@ -8,3 +8,4 @@ POST_DISCLOSURE = os.getenv(
     "POST_DISCLOSURE",
     "Questo post contiene link affiliati Amazon.",
 ).strip()
+BOT_STORE_FILE = os.getenv("BOT_STORE_FILE", "bot_store.json").strip()

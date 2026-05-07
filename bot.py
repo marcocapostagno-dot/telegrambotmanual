@@ -1,12 +1,21 @@
+import json
 import logging
 import os
 import re
 from html import escape
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,16 +35,33 @@ DISCLOSURE = os.getenv(
     "POST_DISCLOSURE",
     "Questo post contiene link affiliati Amazon.",
 ).strip()
-
-AMAZON_HOSTS = {
-    "amazon.it",
-    "www.amazon.it",
-    "amzn.to",
-    "www.amzn.to",
-}
-
+STORE_FILE = Path(os.getenv("BOT_STORE_FILE", "bot_store.json")).expanduser()
+DRAFT_PREFIX = "draft:"
+PUBLISHED_PREFIX = "published:"
+AMAZON_HOSTS = {"amazon.it", "www.amazon.it", "amzn.to", "www.amzn.to"}
 ASIN_RE = re.compile(r"(?:/dp/|/gp/product/|/product/)([A-Z0-9]{10})", re.IGNORECASE)
 SHORT_TEXT_RE = re.compile(r"^/post(?:@\w+)?\s+(.+)$", re.DOTALL)
+URL_RE = re.compile(r"https?://\S+")
+
+
+def load_store() -> dict:
+    if not STORE_FILE.exists():
+        return {"drafts": {}, "published": []}
+    try:
+        with STORE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("drafts", {})
+        data.setdefault("published", [])
+        return data
+    except Exception:
+        logger.exception("Impossibile leggere %s, ne creo uno nuovo", STORE_FILE)
+        return {"drafts": {}, "published": []}
+
+
+def save_store(store: dict) -> None:
+    STORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with STORE_FILE.open("w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
 
 
 def _check_config() -> None:
@@ -79,12 +105,11 @@ def normalize_amazon_url(raw_url: str) -> str:
     if host not in AMAZON_HOSTS and "amazon.it" not in host and "amzn.to" not in host:
         raise ValueError("Il link non sembra un URL Amazon valido")
 
-    clean_url = add_affiliate_tag(raw_url)
-    return clean_url
+    return add_affiliate_tag(raw_url)
 
 
 def extract_url(text: str) -> str | None:
-    match = re.search(r"https?://\S+", text)
+    match = URL_RE.search(text or "")
     return match.group(0) if match else None
 
 
@@ -99,7 +124,7 @@ def build_caption(url: str, original_text: str) -> str:
     asin = extract_asin(url)
     lines = []
 
-    cleaned_text = original_text.strip()
+    cleaned_text = (original_text or "").strip()
     if cleaned_text:
         lines.append(escape(cleaned_text))
     else:
@@ -113,11 +138,83 @@ def build_caption(url: str, original_text: str) -> str:
     return "\n".join(lines)
 
 
+def draft_keyboard(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Pubblica", callback_data=f"publish:{draft_id}"),
+                InlineKeyboardButton("❌ Annulla", callback_data=f"cancel:{draft_id}"),
+            ]
+        ]
+    )
+
+
+def published_key(url: str) -> str:
+    asin = extract_asin(url)
+    return f"asin:{asin}" if asin else f"url:{url}"
+
+
+def parse_submission_from_message(message: Message) -> dict:
+    text = message.caption or message.text or ""
+    url = extract_url(text)
+    if not url:
+        raise ValueError("Mandami un link Amazon valido nel testo o nella caption.")
+
+    affiliate_url = normalize_amazon_url(url)
+    custom_text = text.replace(url, "", 1).strip(" -\n")
+    photo_file_id = None
+    if message.photo:
+        photo_file_id = message.photo[-1].file_id
+
+    return {
+        "url": affiliate_url,
+        "text": custom_text,
+        "caption": build_caption(affiliate_url, custom_text),
+        "asin": extract_asin(affiliate_url),
+        "photo_file_id": photo_file_id,
+    }
+
+
+def save_draft(user_id: int, draft: dict) -> str:
+    store = load_store()
+    draft_id = f"{user_id}_{len(store['drafts']) + 1}"
+    store["drafts"][draft_id] = draft
+    save_store(store)
+    return draft_id
+
+
+def get_draft(draft_id: str) -> dict | None:
+    store = load_store()
+    return store.get("drafts", {}).get(draft_id)
+
+
+def delete_draft(draft_id: str) -> None:
+    store = load_store()
+    store.get("drafts", {}).pop(draft_id, None)
+    save_store(store)
+
+
+def is_duplicate(url: str) -> bool:
+    key = published_key(url)
+    store = load_store()
+    return key in store.get("published", [])
+
+
+def mark_published(url: str) -> None:
+    key = published_key(url)
+    store = load_store()
+    published = store.get("published", [])
+    if key not in published:
+        published.append(key)
+    store["published"] = published[-500:]
+    save_store(store)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     await update.message.reply_text(
-        "Mandami un link Amazon oppure usa /post link testo opzionale."
+        "Mandami un link Amazon, oppure foto + caption con link Amazon. Ti preparo una preview privata con i pulsanti."
     )
 
 
@@ -126,8 +223,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.message.reply_text(
         "Uso rapido:\n"
-        "/post https://www.amazon.it/dp/ASIN Testo opzionale\n\n"
-        "Oppure incolla semplicemente un link Amazon in chat privata e il bot lo pubblicherà su canale."
+        "1) Invia un link Amazon in privato\n"
+        "2) Oppure invia foto + caption con link Amazon\n"
+        "3) Ricevi anteprima privata\n"
+        "4) Premi Pubblica o Annulla\n\n"
+        "Comando supportato:\n"
+        "/post https://www.amazon.it/dp/ASIN Testo opzionale"
     )
 
 
@@ -142,53 +243,127 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     payload = match.group(1).strip()
-    url = extract_url(payload)
-    if not url:
-        await update.message.reply_text("Non ho trovato un link nel comando.")
-        return
+    fake_message = update.message
+    fake_message.text = payload
+    await create_preview_from_message(update, context, fake_message)
 
-    custom_text = payload.replace(url, "", 1).strip(" -\n")
+
+async def create_preview_from_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source_message: Message | None = None,
+) -> None:
+    message = source_message or update.message
 
     try:
-        affiliate_url = normalize_amazon_url(url)
-        caption = build_caption(affiliate_url, custom_text)
-        await context.bot.send_message(
-            chat_id=TARGET_CHANNEL,
-            text=caption,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False,
-        )
-        await update.message.reply_text("Pubblicato su canale.")
+        draft = parse_submission_from_message(message)
+        if is_duplicate(draft["url"]):
+            await message.reply_text("Questo prodotto sembra già pubblicato sul canale.")
+            return
+
+        draft_id = save_draft(update.effective_user.id, draft)
+        preview_header = "📝 Anteprima privata\n\n"
+        if draft.get("photo_file_id"):
+            await message.reply_photo(
+                photo=draft["photo_file_id"],
+                caption=preview_header + draft["caption"],
+                parse_mode=ParseMode.HTML,
+                reply_markup=draft_keyboard(draft_id),
+            )
+        else:
+            await message.reply_text(
+                preview_header + draft["caption"],
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=False,
+                reply_markup=draft_keyboard(draft_id),
+            )
     except Exception as exc:
-        logger.exception("Errore pubblicazione comando /post: %s", exc)
-        await update.message.reply_text(f"Errore: {exc}")
+        logger.exception("Errore creazione preview: %s", exc)
+        await message.reply_text(f"Errore: {exc}")
 
 
 async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
+    await create_preview_from_message(update, context)
 
-    text = update.message.text or ""
-    url = extract_url(text)
-    if not url:
-        await update.message.reply_text("Mandami un link Amazon valido.")
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
         return
 
-    custom_text = text.replace(url, "", 1).strip(" -\n")
+    await query.answer()
 
-    try:
-        affiliate_url = normalize_amazon_url(url)
-        caption = build_caption(affiliate_url, custom_text)
-        await context.bot.send_message(
-            chat_id=TARGET_CHANNEL,
-            text=caption,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False,
-        )
-        await update.message.reply_text("Pubblicato su canale.")
-    except Exception as exc:
-        logger.exception("Errore pubblicazione da messaggio privato: %s", exc)
-        await update.message.reply_text(f"Errore: {exc}")
+    if not is_allowed(update):
+        return
+
+    data = query.data or ""
+    if ":" not in data:
+        return
+
+    action, draft_id = data.split(":", 1)
+    draft = get_draft(draft_id)
+
+    if not draft:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Bozza non trovata o già usata.")
+        return
+
+    if action == "cancel":
+        delete_draft(draft_id)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Bozza annullata.")
+        return
+
+    if action == "publish":
+        try:
+            if is_duplicate(draft["url"]):
+                delete_draft(draft_id)
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.reply_text("Prodotto già pubblicato in precedenza.")
+                return
+
+            if draft.get("photo_file_id"):
+                await context.bot.send_photo(
+                    chat_id=TARGET_CHANNEL,
+                    photo=draft["photo_file_id"],
+                    caption=draft["caption"],
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=TARGET_CHANNEL,
+                    text=draft["caption"],
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=False,
+                )
+
+            mark_published(draft["url"])
+            delete_draft(draft_id)
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("Pubblicato su canale.")
+        except Exception as exc:
+            logger.exception("Errore pubblicazione bozza: %s", exc)
+            await query.message.reply_text(f"Errore pubblicazione: {exc}")
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    store = load_store()
+    store["drafts"] = {}
+    save_store(store)
+    await update.message.reply_text("Bozze cancellate.")
+
+
+async def reset_published_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    store = load_store()
+    store["published"] = []
+    save_store(store)
+    await update.message.reply_text("Storico pubblicazioni azzerato.")
 
 
 def run() -> None:
@@ -197,6 +372,14 @@ def run() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("post", post_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, private_message_handler))
-    logger.info("Bot posting Amazon avviato")
+    application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("resetpublished", reset_published_command))
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
+            private_message_handler,
+        )
+    )
+    logger.info("Bot Amazon preview/publish avviato")
     application.run_polling(drop_pending_updates=True)
