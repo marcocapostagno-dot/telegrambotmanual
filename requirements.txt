@@ -1,5 +1,2 @@
-from pathlib import Path
-Path('output/main.py').write_text(Path('output/main.py').read_text())
-Path('output/settings.py').write_text(Path('output/settings.py').read_text())
-Path('output/requirements.txt').write_text(Path('output/requirements.txt').read_text())
-print('ready')
+python-telegram-bot==21.11.1
+requests==2.32.3
